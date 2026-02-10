@@ -508,7 +508,19 @@ declare global {
       assemblyAiStreamingStatus?: () => Promise<{
         isConnected: boolean;
         sessionId: string | null;
+        hasWarmConnection: boolean;
+        hasValidToken: boolean;
+        tokenExpiresInMs: number;
+        rewarmAttempts: number;
       }>;
+      assemblyAiStreamingRefreshToken?: () => Promise<{
+        success: boolean;
+        error?: string;
+        code?: string;
+      }>;
+      onStreamingShouldRewarm?: (
+        callback: (data: { reason: string }) => void
+      ) => () => void;
       onAssemblyAiPartialTranscript?: (callback: (text: string) => void) => () => void;
       onAssemblyAiFinalTranscript?: (callback: (text: string) => void) => () => void;
       onAssemblyAiError?: (callback: (error: string) => void) => () => void;

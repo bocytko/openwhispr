@@ -9,6 +9,7 @@ export const useAudioRecording = (toast, options = {}) => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [partialTranscript, setPartialTranscript] = useState("");
+  const [isStreamingWarm, setIsStreamingWarm] = useState(false);
   const audioManagerRef = useRef(null);
   const { onToggle } = options;
 
@@ -139,6 +140,15 @@ export const useAudioRecording = (toast, options = {}) => {
 
     audioManagerRef.current.warmupStreamingConnection();
 
+    const warmStatePoller = setInterval(async () => {
+      try {
+        const status = await window.electronAPI.assemblyAiStreamingStatus?.();
+        setIsStreamingWarm(status?.hasWarmConnection ?? false);
+      } catch {
+        setIsStreamingWarm(false);
+      }
+    }, 5000);
+
     const handleToggle = async () => {
       if (!audioManagerRef.current) return;
       const currentState = audioManagerRef.current.getState();
@@ -185,6 +195,7 @@ export const useAudioRecording = (toast, options = {}) => {
 
     // Cleanup
     return () => {
+      clearInterval(warmStatePoller);
       disposeToggle?.();
       disposeStart?.();
       disposeStop?.();
@@ -237,6 +248,7 @@ export const useAudioRecording = (toast, options = {}) => {
     isRecording,
     isProcessing,
     isStreaming,
+    isStreamingWarm,
     transcript,
     partialTranscript,
     startRecording,

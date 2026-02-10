@@ -1,4 +1,4 @@
-const { ipcMain, app, shell, BrowserWindow } = require("electron");
+const { ipcMain, app, shell, BrowserWindow, powerMonitor } = require("electron");
 const path = require("path");
 const http = require("http");
 const https = require("https");
@@ -1567,6 +1567,7 @@ class IPCHandlers {
 
         if (!this.assemblyAiStreaming) {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
+          this._wireStreamingCallbacks(fetchStreamingToken);
         }
 
         if (this.assemblyAiStreaming.hasWarmConnection()) {
@@ -1612,6 +1613,7 @@ class IPCHandlers {
 
         if (!this.assemblyAiStreaming) {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
+          this._wireStreamingCallbacks(fetchStreamingToken);
         }
 
         // Clean up any stale active connection (shouldn't happen normally)
@@ -1702,8 +1704,7 @@ class IPCHandlers {
         let result = { text: "" };
         if (this.assemblyAiStreaming) {
           result = await this.assemblyAiStreaming.disconnect(true);
-          this.assemblyAiStreaming.cleanupAll();
-          this.assemblyAiStreaming = null;
+          this.assemblyAiStreaming.resetSession();
         }
 
         return { success: true, text: result?.text || "" };
@@ -1715,10 +1716,59 @@ class IPCHandlers {
 
     ipcMain.handle("assemblyai-streaming-status", async () => {
       if (!this.assemblyAiStreaming) {
-        return { isConnected: false, sessionId: null };
+        return { isConnected: false, sessionId: null, hasWarmConnection: false, hasValidToken: false, tokenExpiresInMs: 0, rewarmAttempts: 0 };
       }
       return this.assemblyAiStreaming.getStatus();
     });
+
+    ipcMain.handle("assemblyai-streaming-refresh-token", async (event) => {
+      try {
+        const apiUrl = getApiUrl();
+        if (!apiUrl) {
+          return { success: false, error: "API not configured", code: "NO_API" };
+        }
+
+        const token = await fetchStreamingToken(event);
+        if (this.assemblyAiStreaming) {
+          this.assemblyAiStreaming.cacheToken(token);
+        }
+
+        return { success: true };
+      } catch (error) {
+        if (error.code === "AUTH_EXPIRED") {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        return { success: false, error: error.message };
+      }
+    });
+
+    // Re-warm streaming connection after system resume (sleep/wake kills TCP sockets)
+    powerMonitor.on("resume", () => {
+      debugLogger.debug("System resumed from sleep, signaling streaming re-warm", {}, "streaming");
+      if (this.assemblyAiStreaming) {
+        this.assemblyAiStreaming.cleanupWarmConnection();
+      }
+      this.broadcastToWindows("streaming-should-rewarm", { reason: "system-resume" });
+    });
+  }
+
+  _wireStreamingCallbacks(fetchStreamingToken) {
+    this.assemblyAiStreaming.onWarmConnectionLost = () => {
+      debugLogger.debug("Warm connection lost, notifying renderer", {}, "streaming");
+      this.broadcastToWindows("streaming-should-rewarm", { reason: "connection-lost" });
+    };
+
+    this.assemblyAiStreaming.refreshTokenCallback = async () => {
+      const windows = BrowserWindow.getAllWindows();
+      const liveWin = windows.find((w) => !w.isDestroyed());
+      if (!liveWin) return null;
+      try {
+        return await fetchStreamingToken({ sender: liveWin.webContents });
+      } catch (err) {
+        debugLogger.debug("Token refresh callback failed", { error: err.message }, "streaming");
+        return null;
+      }
+    };
   }
 
   broadcastToWindows(channel, payload) {

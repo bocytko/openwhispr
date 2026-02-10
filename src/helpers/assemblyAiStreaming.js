@@ -36,6 +36,8 @@ class AssemblyAiStreaming {
     this.rewarmTimer = null;
     this.keepAliveInterval = null;
     this.isDisconnecting = false;
+    this.onWarmConnectionLost = null;
+    this.refreshTokenCallback = null;
   }
 
   buildWebSocketUrl(options) {
@@ -76,12 +78,27 @@ class AssemblyAiStreaming {
           this.warmConnection.ping();
         } catch (err) {
           debugLogger.debug("AssemblyAI keep-alive ping failed", { error: err.message });
-          this.cleanupWarmConnection();
+          this._handleWarmConnectionDead();
         }
+      } else if (this.warmConnection) {
+        debugLogger.debug("AssemblyAI warm connection no longer open", {
+          readyState: this.warmConnection.readyState,
+        });
+        this._handleWarmConnectionDead();
       } else {
         this.stopKeepAlive();
       }
     }, KEEPALIVE_INTERVAL_MS);
+  }
+
+  _handleWarmConnectionDead() {
+    const savedOptions = this.warmConnectionOptions ? { ...this.warmConnectionOptions } : null;
+    this.cleanupWarmConnection();
+    if (savedOptions) {
+      this.warmConnectionOptions = savedOptions;
+      this.scheduleRewarm();
+    }
+    this.onWarmConnectionLost?.();
   }
 
   stopKeepAlive() {
@@ -176,12 +193,10 @@ class AssemblyAiStreaming {
       return;
     }
     if (this.isConnected) {
-      // Active session in progress, don't re-warm
       return;
     }
-    const token = this.getCachedToken();
-    if (!token || !this.warmConnectionOptions) {
-      debugLogger.debug("AssemblyAI cannot re-warm: no valid token or options");
+    if (!this.warmConnectionOptions) {
+      debugLogger.debug("AssemblyAI cannot re-warm: no saved options");
       return;
     }
 
@@ -192,9 +207,25 @@ class AssemblyAiStreaming {
       delayMs: delay,
     });
     clearTimeout(this.rewarmTimer);
-    this.rewarmTimer = setTimeout(() => {
+    this.rewarmTimer = setTimeout(async () => {
       this.rewarmTimer = null;
       if (this.hasWarmConnection() || this.isConnected) return;
+
+      let token = this.getCachedToken();
+      if (!token && this.refreshTokenCallback) {
+        try {
+          token = await this.refreshTokenCallback();
+          if (token) this.cacheToken(token);
+        } catch (err) {
+          debugLogger.debug("AssemblyAI token refresh for re-warm failed", { error: err.message });
+          return;
+        }
+      }
+      if (!token) {
+        debugLogger.debug("AssemblyAI cannot re-warm: no valid token");
+        return;
+      }
+
       this.warmup({ ...this.warmConnectionOptions, token }).catch((err) => {
         debugLogger.debug("AssemblyAI auto re-warm failed", { error: err.message });
       });
@@ -519,6 +550,12 @@ class AssemblyAiStreaming {
     clearTimeout(this.connectionTimeout);
     this.connectionTimeout = null;
 
+    if (this.pendingReject) {
+      this.pendingReject(new Error("Connection cleaned up"));
+      this.pendingReject = null;
+      this.pendingResolve = null;
+    }
+
     if (this.ws) {
       try {
         this.ws.close();
@@ -531,6 +568,12 @@ class AssemblyAiStreaming {
     this.isConnected = false;
     this.sessionId = null;
     this.terminationResolve = null;
+  }
+
+  resetSession() {
+    this.accumulatedText = "";
+    this.lastTurnText = "";
+    this.turns = [];
   }
 
   cleanupAll() {
@@ -550,6 +593,10 @@ class AssemblyAiStreaming {
       sessionId: this.sessionId,
       hasWarmConnection: this.hasWarmConnection(),
       hasValidToken: this.isTokenValid(),
+      tokenExpiresInMs: this.tokenFetchedAt
+        ? Math.max(0, (TOKEN_EXPIRY_MS - TOKEN_REFRESH_BUFFER_MS) - (Date.now() - this.tokenFetchedAt))
+        : 0,
+      rewarmAttempts: this.rewarmAttempts,
     };
   }
 }

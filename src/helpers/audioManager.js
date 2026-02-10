@@ -59,6 +59,9 @@ class AudioManager {
     this.persistentAudioContext = null;
     this.workletModuleLoaded = false;
     this.workletBlobUrl = null;
+    this.warmStateCheckInterval = null;
+    this.networkReconnectListener = null;
+    this.rewarmListenerCleanup = null;
   }
 
   getWorkletBlobUrl() {
@@ -1714,9 +1717,104 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     );
   }
 
+  startWarmStateMonitor() {
+    this.stopWarmStateMonitor();
+    const WARM_CHECK_INTERVAL_MS = 60_000;
+    const TOKEN_REFRESH_THRESHOLD_MS = 90_000;
+
+    this.warmStateCheckInterval = setInterval(async () => {
+      if (!this.shouldUseStreaming()) return;
+
+      try {
+        const status = await window.electronAPI.assemblyAiStreamingStatus?.();
+        if (!status) return;
+
+        if (!status.hasWarmConnection && !status.isConnected) {
+          logger.debug("Warm state monitor: no warm connection, triggering warmup", {}, "streaming");
+          this.warmupStreamingConnection().catch((e) => {
+            logger.debug("Warm state monitor: warmup failed", { error: e.message }, "streaming");
+          });
+          return;
+        }
+
+        if (status.hasWarmConnection && status.tokenExpiresInMs < TOKEN_REFRESH_THRESHOLD_MS) {
+          logger.debug("Warm state monitor: token expiring soon, refreshing", {
+            expiresInMs: status.tokenExpiresInMs,
+          }, "streaming");
+          await withSessionRefresh(async () => {
+            const res = await window.electronAPI.assemblyAiStreamingRefreshToken?.();
+            if (!res?.success && res?.code) {
+              const err = new Error(res.error || "Token refresh failed");
+              err.code = res.code;
+              throw err;
+            }
+          });
+        }
+      } catch (e) {
+        logger.debug("Warm state monitor error", { error: e.message }, "streaming");
+      }
+    }, WARM_CHECK_INTERVAL_MS);
+  }
+
+  stopWarmStateMonitor() {
+    if (this.warmStateCheckInterval) {
+      clearInterval(this.warmStateCheckInterval);
+      this.warmStateCheckInterval = null;
+    }
+  }
+
+  startNetworkListener() {
+    this.stopNetworkListener();
+    this.networkReconnectListener = () => {
+      if (!this.shouldUseStreaming()) return;
+      logger.debug("Network came back online, triggering streaming warmup", {}, "streaming");
+      setTimeout(() => {
+        this.warmupStreamingConnection().catch((e) => {
+          logger.debug("Network reconnect warmup failed", { error: e.message }, "streaming");
+        });
+      }, 2000);
+    };
+    window.addEventListener("online", this.networkReconnectListener);
+  }
+
+  stopNetworkListener() {
+    if (this.networkReconnectListener) {
+      window.removeEventListener("online", this.networkReconnectListener);
+      this.networkReconnectListener = null;
+    }
+  }
+
+  startSystemRewarmListener() {
+    this.stopSystemRewarmListener();
+    this.rewarmListenerCleanup = window.electronAPI.onStreamingShouldRewarm?.((data) => {
+      if (!this.shouldUseStreaming()) return;
+      logger.debug("Received streaming re-warm signal", data, "streaming");
+      const delay = data?.reason === "system-resume" ? 3000 : 1000;
+      setTimeout(() => {
+        this.warmupStreamingConnection().catch((e) => {
+          logger.debug("System event warmup failed", { error: e.message, reason: data?.reason }, "streaming");
+        });
+      }, delay);
+    });
+  }
+
+  stopSystemRewarmListener() {
+    if (this.rewarmListenerCleanup) {
+      this.rewarmListenerCleanup();
+      this.rewarmListenerCleanup = null;
+    }
+  }
+
+  stopAllWarmMonitors() {
+    this.stopWarmStateMonitor();
+    this.stopNetworkListener();
+    this.stopSystemRewarmListener();
+  }
+
   async warmupStreamingConnection() {
     if (!this.shouldUseStreaming()) {
       logger.debug("Streaming warmup skipped - not in streaming mode", {}, "streaming");
+      this.stopAllWarmMonitors();
       return false;
     }
 
@@ -1773,6 +1871,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             );
           }
         }
+
+        this.startWarmStateMonitor();
+        this.startNetworkListener();
+        this.startSystemRewarmListener();
 
         logger.info(
           "AssemblyAI streaming connection warmed up",
@@ -2205,6 +2307,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   cleanup() {
+    this.stopAllWarmMonitors();
     if (this.isStreaming) {
       this.cleanupStreaming();
     }
