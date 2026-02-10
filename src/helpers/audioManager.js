@@ -1721,14 +1721,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
 
     try {
-      const [, wsResult] = await Promise.all([
+      // Run token pre-fetch and mic ID cache in parallel
+      const [, tokenResult] = await Promise.all([
         this.cacheMicrophoneDeviceId(),
         withSessionRefresh(async () => {
-          const res = await window.electronAPI.assemblyAiStreamingWarmup({
-            sampleRate: 16000,
-            language: getBaseLanguageCode(localStorage.getItem("preferredLanguage")),
-          });
-          // Throw error to trigger retry if AUTH_EXPIRED
+          const res = await window.electronAPI.assemblyAiStreamingWarmup();
           if (!res.success && res.code) {
             const err = new Error(res.error || "Warmup failed");
             err.code = res.code;
@@ -1738,57 +1735,58 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }),
       ]);
 
-      if (wsResult.success) {
-        // Pre-load AudioWorklet module so first recording is faster
+      if (!tokenResult.success) {
+        if (tokenResult.code === "NO_API") {
+          logger.debug("Streaming warmup skipped - API not configured", {}, "streaming");
+        } else {
+          logger.warn("Streaming token warmup failed", { error: tokenResult.error }, "streaming");
+        }
+        return false;
+      }
+
+      // Pre-load AudioWorklet module
+      try {
+        const audioContext = await this.getOrCreateAudioContext();
+        if (!this.workletModuleLoaded) {
+          await audioContext.audioWorklet.addModule(this.getWorkletBlobUrl());
+          this.workletModuleLoaded = true;
+          logger.debug("AudioWorklet module pre-loaded during warmup", {}, "streaming");
+        }
+      } catch (e) {
+        logger.debug(
+          "AudioWorklet pre-load failed (will retry on recording)",
+          { error: e.message },
+          "streaming"
+        );
+      }
+
+      // Warm up the OS audio driver by briefly acquiring the mic, then releasing.
+      // Forces macOS to initialize the audio subsystem so subsequent
+      // getUserMedia calls resolve in ~100-200ms instead of ~500-1000ms.
+      if (!this.micDriverWarmedUp) {
         try {
-          const audioContext = await this.getOrCreateAudioContext();
-          if (!this.workletModuleLoaded) {
-            await audioContext.audioWorklet.addModule(this.getWorkletBlobUrl());
-            this.workletModuleLoaded = true;
-            logger.debug("AudioWorklet module pre-loaded during warmup", {}, "streaming");
-          }
+          const constraints = await this.getAudioConstraints();
+          const tempStream = await navigator.mediaDevices.getUserMedia(constraints);
+          tempStream.getTracks().forEach((track) => track.stop());
+          this.micDriverWarmedUp = true;
+          logger.debug("Microphone driver pre-warmed", {}, "streaming");
         } catch (e) {
           logger.debug(
-            "AudioWorklet pre-load failed (will retry on recording)",
+            "Mic driver warmup failed (non-critical)",
             { error: e.message },
             "streaming"
           );
         }
-
-        // Warm up the OS audio driver by briefly acquiring the mic, then releasing.
-        // This forces macOS to initialize the audio subsystem so subsequent
-        // getUserMedia calls resolve in ~100-200ms instead of ~500-1000ms.
-        if (!this.micDriverWarmedUp) {
-          try {
-            const constraints = await this.getAudioConstraints();
-            const tempStream = await navigator.mediaDevices.getUserMedia(constraints);
-            tempStream.getTracks().forEach((track) => track.stop());
-            this.micDriverWarmedUp = true;
-            logger.debug("Microphone driver pre-warmed", {}, "streaming");
-          } catch (e) {
-            logger.debug(
-              "Mic driver warmup failed (non-critical)",
-              { error: e.message },
-              "streaming"
-            );
-          }
-        }
-
-        logger.info(
-          "AssemblyAI streaming connection warmed up",
-          { alreadyWarm: wsResult.alreadyWarm, micCached: !!this.cachedMicDeviceId },
-          "streaming"
-        );
-        return true;
-      } else if (wsResult.code === "NO_API") {
-        logger.debug("Streaming warmup skipped - API not configured", {}, "streaming");
-        return false;
-      } else {
-        logger.warn("AssemblyAI warmup failed", { error: wsResult.error }, "streaming");
-        return false;
       }
+
+      logger.info(
+        "Streaming warmup complete",
+        { micCached: !!this.cachedMicDeviceId, micDriverWarmed: this.micDriverWarmedUp },
+        "streaming"
+      );
+      return true;
     } catch (error) {
-      logger.error("AssemblyAI warmup error", { error: error.message }, "streaming");
+      logger.error("Streaming warmup error", { error: error.message }, "streaming");
       return false;
     }
   }
@@ -1816,7 +1814,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       const tConstraints = performance.now();
 
       // Run getUserMedia and WebSocket connect in parallel.
-      // With warmup, WS resolves in ~5ms; getUserMedia (~500ms) dominates.
       const [stream, result] = await Promise.all([
         navigator.mediaDevices.getUserMedia(constraints),
         withSessionRefresh(async () => {
@@ -1890,7 +1887,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           getUserMediaAndWsMs: Math.round(tParallel - tConstraints),
           pipelineMs: Math.round(tReady - tParallel),
           totalMs: Math.round(tReady - t0),
-          usedWarmConnection: result.usedWarmConnection,
           micDriverWarmedUp: !!this.micDriverWarmedUp,
         },
         "streaming"
@@ -1961,6 +1957,21 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         errorTitle = "Sign-in Required";
         errorDescription =
           "Your OpenWhispr Cloud session is unavailable. Please sign in again from Settings.";
+      } else if (error.code === "LIMIT_REACHED") {
+        errorTitle = "Weekly Limit Reached";
+        errorDescription =
+          "You've reached your free weekly word limit. Upgrade to Pro for unlimited transcription.";
+        this.onError?.({
+          title: errorTitle,
+          description: errorDescription,
+          code: "LIMIT_REACHED",
+        });
+        window.electronAPI?.notifyLimitReached?.({
+          wordsUsed: 2000,
+          limit: 2000,
+        });
+        await this.cleanupStreaming();
+        return false;
       }
 
       this.onError?.({

@@ -485,13 +485,11 @@ declare global {
         language?: string;
       }) => Promise<{
         success: boolean;
-        alreadyWarm?: boolean;
         error?: string;
         code?: string;
       }>;
       assemblyAiStreamingStart?: (options?: { sampleRate?: number; language?: string }) => Promise<{
         success: boolean;
-        usedWarmConnection?: boolean;
         error?: string;
         code?: string;
       }>;

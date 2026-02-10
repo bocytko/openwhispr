@@ -1544,6 +1544,11 @@ class IPCHandlers {
           err.code = "AUTH_EXPIRED";
           throw err;
         }
+        if (tokenResponse.status === 429) {
+          const err = new Error("Weekly word limit reached");
+          err.code = "LIMIT_REACHED";
+          throw err;
+        }
         const errorData = await tokenResponse.json().catch(() => ({}));
         throw new Error(
           errorData.error || `Failed to get streaming token: ${tokenResponse.status}`
@@ -1558,7 +1563,7 @@ class IPCHandlers {
       return token;
     };
 
-    ipcMain.handle("assemblyai-streaming-warmup", async (event, options = {}) => {
+    ipcMain.handle("assemblyai-streaming-warmup", async (event) => {
       try {
         const apiUrl = getApiUrl();
         if (!apiUrl) {
@@ -1569,25 +1574,23 @@ class IPCHandlers {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
         }
 
-        if (this.assemblyAiStreaming.hasWarmConnection()) {
-          debugLogger.debug("AssemblyAI connection already warm", {}, "streaming");
-          return { success: true, alreadyWarm: true };
-        }
-
+        // Pre-fetch and cache the token (no WebSocket session opened)
         let token = this.assemblyAiStreaming.getCachedToken();
         if (!token) {
-          debugLogger.debug("Fetching new streaming token for warmup", {}, "streaming");
+          debugLogger.debug("Pre-fetching streaming token", {}, "streaming");
           token = await fetchStreamingToken(event);
+          this.assemblyAiStreaming.cacheToken(token);
         }
 
-        await this.assemblyAiStreaming.warmup({ ...options, token });
-        debugLogger.debug("AssemblyAI connection warmed up", {}, "streaming");
-
+        debugLogger.debug("Streaming token cached for warmup", {}, "streaming");
         return { success: true };
       } catch (error) {
         debugLogger.error("AssemblyAI warmup error", { error: error.message });
         if (error.code === "AUTH_EXPIRED") {
           return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        if (error.code === "LIMIT_REACHED") {
+          return { success: false, error: error.message, code: "LIMIT_REACHED" };
         }
         return { success: false, error: error.message };
       }
@@ -1624,12 +1627,7 @@ class IPCHandlers {
           await this.assemblyAiStreaming.disconnect(false);
         }
 
-        const hasWarm = this.assemblyAiStreaming.hasWarmConnection();
-        debugLogger.debug(
-          "AssemblyAI streaming start",
-          { hasWarmConnection: hasWarm },
-          "streaming"
-        );
+        debugLogger.debug("AssemblyAI streaming start", {}, "streaming");
 
         let token = this.assemblyAiStreaming.getCachedToken();
         if (!token) {
@@ -1668,14 +1666,14 @@ class IPCHandlers {
         await this.assemblyAiStreaming.connect({ ...options, token });
         debugLogger.debug("AssemblyAI streaming started", {}, "streaming");
 
-        return {
-          success: true,
-          usedWarmConnection: this.assemblyAiStreaming.hasWarmConnection() === false,
-        };
+        return { success: true };
       } catch (error) {
         debugLogger.error("AssemblyAI streaming start error", { error: error.message });
         if (error.code === "AUTH_EXPIRED") {
           return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        if (error.code === "LIMIT_REACHED") {
+          return { success: false, error: error.message, code: "LIMIT_REACHED" };
         }
         return { success: false, error: error.message };
       } finally {
@@ -1697,13 +1695,34 @@ class IPCHandlers {
       this.assemblyAiStreaming?.forceEndpoint();
     });
 
-    ipcMain.handle("assemblyai-streaming-stop", async () => {
+    ipcMain.handle("assemblyai-streaming-stop", async (event) => {
       try {
         let result = { text: "" };
         if (this.assemblyAiStreaming) {
           result = await this.assemblyAiStreaming.disconnect(true);
           this.assemblyAiStreaming.cleanupAll();
           this.assemblyAiStreaming = null;
+        }
+
+        // Report streaming usage to API (fire-and-forget)
+        if (result?.text && result?.audioDuration) {
+          const apiUrl = getApiUrl();
+          const cookieHeader = await getSessionCookies(event).catch(() => "");
+          if (apiUrl && cookieHeader) {
+            fetch(`${apiUrl}/api/streaming-usage`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Cookie: cookieHeader,
+              },
+              body: JSON.stringify({
+                text: result.text,
+                audioDurationSeconds: result.audioDuration,
+              }),
+            }).catch((err) => {
+              debugLogger.error("Failed to report streaming usage", { error: err.message });
+            });
+          }
         }
 
         return { success: true, text: result?.text || "" };
